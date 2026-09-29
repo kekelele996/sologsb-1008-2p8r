@@ -1,10 +1,18 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import type { PendingConflict, ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
+import {
+  STORAGE_KEY,
+  applyConflictAction,
+  buildResolution,
+  mergeProjects,
+  migrateProject,
+  persistProject,
+  readPersisted,
+} from "../storage";
 
-const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
@@ -21,12 +29,43 @@ function statusClass(status: ReviewStatus) {
   return "badge-neutral";
 }
 
+/**
+ * 以共同祖先 base 为参照，把本页编辑并入已存档版本并分配新修订号。
+ * 纯函数，页面卸载前的同步保存也走这里。
+ */
+function prepareSave(base: SignProject, localDraft: SignProject, stored: SignProject | null) {
+  let next: SignProject = structuredClone(localDraft);
+  let mergedIn = false;
+  let conflictCount = 0;
+  if (stored && stored.revision > base.revision) {
+    const result = mergeProjects(base, next, stored, stored.resolutions ?? []);
+    next = result.merged;
+    mergedIn = true;
+    conflictCount = result.newConflicts.length;
+  }
+  next.revision = (stored ? stored.revision : base.revision) + 1;
+  next.updatedAt = new Date().toISOString();
+  return { next, mergedIn, conflictCount, storedRevision: stored ? stored.revision : base.revision };
+}
+
+/** 模块级纯函数：供 useVisibleTask$ 闭包使用，避免被 Qwik 状态序列化器当成函数捕获 */
+function projectUnchanged(a: SignProject, b: SignProject) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 export default component$(() => {
   const project = useSignal<SignProject>(createSeedProject());
+  /** 本标签页加载/上次成功保存时的共同祖先，三方合并靠它区分“谁真改过” */
+  const baseline = useSignal<SignProject>(structuredClone(project.value));
   const past = useSignal<SignProject[]>([]);
   const future = useSignal<SignProject[]>([]);
   const hydrated = useSignal(false);
   const online = useSignal(true);
+  const saving = useSignal(false);
+  const saveState = useSignal<"" | "recovered" | "memory">("");
+  const saveDetail = useSignal("");
+  const mergeNote = useSignal("");
+  const remoteSavedNotice = useSignal(false);
   const previewWidth = useSignal(480);
   const previewFont = useSignal(42);
   const selectedVersionId = useSignal("");
@@ -39,6 +78,76 @@ export default component$(() => {
   const previewId = useSignal("");
   const readOnly = useSignal(false);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+
+  /** 保存：检测更新的存档→按条目合并→落盘；空间不足时回收+重试，再不行留在内存。 */
+  const persistNow: QRL<() => void> = $(() => {
+    if (!hydrated.value || readOnly.value || saving.value) return;
+    if (projectUnchanged(project.value, baseline.value)) return;
+    saving.value = true;
+    try {
+      const stored = readPersisted();
+      const { next, mergedIn, conflictCount, storedRevision } = prepareSave(baseline.value, project.value, stored);
+      const outcome = persistProject(next);
+      if (outcome.status === "memory") {
+        // 写入彻底失败：当前编辑继续留在内存（页面仍可编辑），并明示用户。
+        // 修订号不推进，等真正落盘成功时再占用下一个号，避免重试导致跳号。
+        outcome.project.revision = storedRevision;
+        project.value = outcome.project;
+        saveState.value = "memory";
+        saveDetail.value = outcome.error ?? "本地存储空间不足";
+      } else {
+        project.value = outcome.project;
+        baseline.value = structuredClone(outcome.project);
+        if (outcome.status === "recovered") {
+          saveState.value = "recovered";
+          saveDetail.value = `本地空间不足，已回收最早的 ${outcome.prunedSnapshots} 条版本快照后完成保存`;
+        } else if (saveState.value === "memory") {
+          // 之前写不下、只在内存里的编辑终于落盘，明确告知用户
+          saveState.value = "recovered";
+          saveDetail.value = "存储空间已恢复，此前只保留在内存中的改动现已保存";
+        } else {
+          saveDetail.value = "";
+        }
+        if (mergedIn) {
+          mergeNote.value = conflictCount
+            ? `已并入另一处保存的改动，其中 ${conflictCount} 处双方都改过，已列为待确认`
+            : "已并入另一处保存的改动";
+          toast.value = mergeNote.value;
+        }
+      }
+    } finally {
+      saving.value = false;
+    }
+  });
+
+  const resolveConflict = $((conflictId: string, side: "local" | "remote") => {
+    const conflict = project.value.pendingConflicts.find((item) => item.id === conflictId);
+    if (!conflict) return;
+    past.value = [...past.value.slice(-49), structuredClone(project.value)];
+    future.value = [];
+    const draft = structuredClone(project.value);
+    const current = draft.pendingConflicts.find((item) => item.id === conflictId)!;
+    applyConflictAction(draft, side === "local" ? current.localAction : current.remoteAction);
+    const resolution = buildResolution(current, side);
+    draft.resolutions = [...draft.resolutions.filter((item) => item.id !== resolution.id), resolution].slice(-100);
+    draft.pendingConflicts = draft.pendingConflicts.filter((item) => item.id !== conflictId);
+    draft.updatedAt = new Date().toISOString();
+    project.value = draft;
+    toast.value = "已按所选内容采纳，保存后对其他标签页生效";
+  });
+
+  const focusConflict = $((conflict: PendingConflict) => {
+    if (conflict.signId && project.value.activeSignId !== conflict.signId) {
+      const draft = structuredClone(project.value);
+      draft.activeSignId = conflict.signId;
+      project.value = draft;
+    }
+    selectedVersionId.value = "";
+  });
+
+  const scrollToConflicts = $(() => {
+    document.getElementById("conflict-panel")?.scrollIntoView({ behavior: "smooth" });
+  });
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -185,8 +294,12 @@ export default component$(() => {
     track(() => hydrated.value);
     if (!hydrated.value) {
       try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        const raw = localStorage.getItem(STORAGE_KEY);
+        const stored = migrateProject(raw ? JSON.parse(raw) : null);
+        if (stored) {
+          project.value = stored;
+          baseline.value = structuredClone(stored);
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -197,14 +310,53 @@ export default component$(() => {
     }
   });
 
+  // 自动保存：合并别人的保存 → 带修订号落盘；空间不足时存储层自动回收快照并重试
   useVisibleTask$(({ track, cleanup }) => {
     track(() => hydrated.value);
     if (!hydrated.value) return;
     track(() => project.value);
-    const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: project.value }));
-    }, 450);
+    if (readOnly.value) return;
+    const timer = window.setTimeout(() => { void persistNow(); }, 450);
     cleanup(() => window.clearTimeout(timer));
+  });
+
+  useVisibleTask$(({ cleanup }) => {
+    // 另一标签页完成保存：先提示，等本页下次保存时再做三方合并，避免边输入边替换
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue || readOnly.value) return;
+      try {
+        const remote = migrateProject(JSON.parse(event.newValue));
+        if (remote && remote.revision > baseline.value.revision) {
+          remoteSavedNotice.value = true;
+        }
+      } catch {
+        // 存档损坏时忽略，下一次保存以本地为准
+      }
+    };
+    // 内存模式下定期重试落盘；页面重新可见或隐藏（关闭/刷新）前也尝试一次
+    const retry = () => {
+      if (saveState.value === "memory") void persistNow();
+    };
+    const flushBeforeUnload = () => {
+      if (readOnly.value || projectUnchanged(project.value, baseline.value)) return;
+      try {
+        const stored = readPersisted();
+        const { next } = prepareSave(baseline.value, project.value, stored);
+        persistProject(next);
+      } catch {
+        // 关闭时无法再提示，静默保留内存中的编辑直到真正卸载
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    document.addEventListener("visibilitychange", retry);
+    window.addEventListener("pagehide", flushBeforeUnload);
+    const interval = window.setInterval(retry, 5000);
+    cleanup(() => {
+      window.removeEventListener("storage", onStorage);
+      document.removeEventListener("visibilitychange", retry);
+      window.removeEventListener("pagehide", flushBeforeUnload);
+      window.clearInterval(interval);
+    });
   });
 
   useVisibleTask$(({ cleanup }) => {
@@ -290,10 +442,31 @@ export default component$(() => {
             aria-label="项目名称"
           />
         </div>
-        <div class="navbar-end gap-2">
+        <div class="navbar-end gap-2 flex-wrap">
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
+          <span class="badge badge-outline border-white/30 text-sky-100" title="本地修订号，每次成功保存 +1">
+            修订 #{project.value.revision}
+            {saveState.value === "memory" ? " · 未落盘" : ""}
+          </span>
+          {project.value.pendingConflicts.length > 0 && (
+            <button
+              class="badge badge-warning gap-1"
+              title="查看双方都改动过、等待人工裁定的内容"
+              onClick$={scrollToConflicts}
+            >
+              ⚠ 待确认 {project.value.pendingConflicts.length}
+            </button>
+          )}
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button
+            class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20"
+            disabled={saving.value}
+            onClick$={persistNow}
+            title="立即保存到本地"
+          >
+            {saving.value ? "保存中…" : "保存"}
+          </button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
           <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
             {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
@@ -301,10 +474,74 @@ export default component$(() => {
         </div>
       </header>
 
+      {saveState.value === "memory" && (
+        <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
+          <span class="text-lg">!</span>
+          <span class="flex-1">
+            <strong>本地存储空间已满</strong>：{saveDetail.value || "写入失败"}。已回收最早的版本快照并重试，仍无法保存。
+            当前改动只保留在本页面内存中，<strong>请勿关闭或刷新标签页</strong>，清理浏览器存储后：
+          </span>
+          <button class="btn btn-sm btn-outline border-white text-white hover:bg-white/20" onClick$={persistNow}>重试保存</button>
+        </div>
+      )}
+
+      {saveState.value === "recovered" && (
+        <div class="alert alert-warning sticky top-16 z-30 rounded-none border-x-0 py-2" onClick$={() => { saveState.value = ""; }}>
+          <span class="text-lg">⚠</span>
+          <span class="flex-1">{saveDetail.value}（修订 #{project.value.revision} 已保存）</span>
+          <span class="text-xs underline cursor-pointer">知道了</span>
+        </div>
+      )}
+
+      {remoteSavedNotice.value && saveState.value !== "memory" && (
+        <div class="alert alert-info sticky top-16 z-30 rounded-none border-x-0 py-2 text-white" onClick$={() => { remoteSavedNotice.value = false; }}>
+          <span class="flex-1">检测到另一标签页已保存更新的修订，本页下次保存时会自动按条目合并，只有双方都改过的字段才会列为待确认。</span>
+          <button class="btn btn-xs btn-outline border-white text-white hover:bg-white/20" onClick$={persistNow}>立即合并保存</button>
+          <span class="text-xs underline cursor-pointer">知道了</span>
+        </div>
+      )}
+
       {active().emergencyRevision && (
         <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
           <span class="text-lg">!</span>
           <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
+        </div>
+      )}
+
+      {project.value.pendingConflicts.length > 0 && (
+        <div id="conflict-panel" class="border-b-4 border-warning bg-amber-50 px-6 py-4">
+          <div class="mx-auto max-w-6xl">
+            <div class="mb-3 flex items-center justify-between">
+              <div>
+                <h2 class="text-base font-bold text-amber-900">⚠ 并发修改待确认（{project.value.pendingConflicts.length}）</h2>
+                <p class="text-xs text-amber-800">同一内容两边都改过，自动合并无法取舍。两份内容都已保留，请逐条选择采用哪一份。</p>
+              </div>
+            </div>
+            <div class="grid gap-3 lg:grid-cols-2">
+              {project.value.pendingConflicts.map((conflict) => (
+                <article key={conflict.id} class="rounded-xl border border-amber-300 bg-white p-3 shadow-sm">
+                  <div class="mb-2 flex items-center justify-between gap-2">
+                    <strong class="text-sm text-slate-800">{conflict.label}</strong>
+                    {conflict.signId && (
+                      <button class="btn btn-xs btn-ghost" onClick$={() => focusConflict(conflict)}>定位标识</button>
+                    )}
+                  </div>
+                  <div class="grid grid-cols-2 gap-2 text-xs">
+                    <div class="rounded-lg border border-sky-200 bg-sky-50 p-2">
+                      <div class="mb-1 font-bold text-sky-700">本标签页</div>
+                      <p class="max-h-28 overflow-auto whitespace-pre-wrap break-words text-slate-700">{conflict.localText}</p>
+                      <button class="btn btn-xs btn-primary mt-2 w-full" onClick$={() => resolveConflict(conflict.id, "local")}>采用本页这份</button>
+                    </div>
+                    <div class="rounded-lg border border-slate-300 bg-slate-50 p-2">
+                      <div class="mb-1 font-bold text-slate-600">另一标签页</div>
+                      <p class="max-h-28 overflow-auto whitespace-pre-wrap break-words text-slate-700">{conflict.remoteText}</p>
+                      <button class="btn btn-xs mt-2 w-full border-slate-400 text-slate-700" onClick$={() => resolveConflict(conflict.id, "remote")}>采用对方这份</button>
+                    </div>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 
