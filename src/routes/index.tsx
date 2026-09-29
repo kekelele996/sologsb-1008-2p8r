@@ -3,8 +3,8 @@ import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { loadFromStorage, projectsEqual, saveProject } from "../storage";
 
-const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
@@ -38,6 +38,12 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  /** 本地编辑所基于的修订号，用于检测并发修改 */
+  const baseRevision = useSignal(0);
+  /** 最近一次同步时的项目快照，用于 diff 出本地真正改过的字段 */
+  const baseProject = useSignal<SignProject>(createSeedProject());
+  /** 存储状态：ok 正常 / reclaimed 已回收快照 / degraded 存储已满仅存内存 */
+  const storageStatus = useSignal<"ok" | "reclaimed" | "degraded">("ok");
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
@@ -174,6 +180,35 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
+  const activeConflicts = () => active().conflicts ?? [];
+
+  const resolveConflict = $((conflictId: string, choice: "local" | "remote") => {
+    commit("处理并发冲突", (draft) => {
+      const sign = draft.signs.find((item) => item.id === draft.activeSignId);
+      if (!sign) return;
+      const conflict = sign.conflicts.find((item) => item.id === conflictId);
+      if (!conflict) return;
+      if (choice === "local") {
+        if (conflict.local.targetText !== undefined) sign.targetText = conflict.local.targetText;
+        if (conflict.local.status !== undefined) sign.status = conflict.local.status;
+        if (conflict.local.termConfirmed) {
+          for (const term of sign.terms) {
+            if (term.id in conflict.local.termConfirmed) {
+              term.confirmed = conflict.local.termConfirmed[term.id];
+            }
+          }
+        }
+      }
+      sign.conflicts = sign.conflicts.filter((item) => item.id !== conflictId);
+    });
+    toast.value = choice === "local" ? "已采用本地版本" : "已保留远端版本";
+  });
+
+  const retryStorage = $(() => {
+    storageStatus.value = "ok";
+    void flushSave();
+  });
+
   const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
@@ -185,15 +220,45 @@ export default component$(() => {
     track(() => hydrated.value);
     if (!hydrated.value) {
       try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        const loaded = loadFromStorage();
+        if (loaded) {
+          project.value = loaded.project;
+          baseRevision.value = loaded.revision;
+          baseProject.value = structuredClone(loaded.project);
+        } else {
+          baseProject.value = structuredClone(project.value);
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
       } catch {
         // Keep bundled sample data when storage is unavailable or malformed.
+        baseProject.value = structuredClone(project.value);
       }
       hydrated.value = true;
+    }
+  });
+
+  const flushSave = $(() => {
+    if (!hydrated.value) return;
+    // 与上次同步状态相同则跳过，避免合并后重复写入
+    if (projectsEqual(project.value, baseProject.value)) return;
+    const outcome = saveProject(project.value, baseRevision.value, baseProject.value);
+    if (outcome.ok) {
+      baseRevision.value = outcome.revision;
+      baseProject.value = structuredClone(outcome.writtenProject);
+      project.value = outcome.writtenProject;
+      storageStatus.value = outcome.reclaimed ? "reclaimed" : "ok";
+      if (outcome.reclaimed) toast.value = "存储空间不足，已回收最早的版本快照";
+      if (outcome.conflicts.length) {
+        toast.value = `检测到 ${outcome.conflicts.length} 处标识在其他标签页被修改，已保留两份并标记待确认`;
+      }
+    } else {
+      // 写不进：编辑留在内存，等待下次重试
+      storageStatus.value = "degraded";
+      baseProject.value = structuredClone(outcome.writtenProject);
+      project.value = outcome.writtenProject;
+      toast.value = "本地存储已满，编辑仅保存在内存中，请清理后重试";
     }
   });
 
@@ -201,10 +266,19 @@ export default component$(() => {
     track(() => hydrated.value);
     if (!hydrated.value) return;
     track(() => project.value);
-    const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: project.value }));
-    }, 450);
+    const timer = window.setTimeout(() => { void flushSave(); }, 450);
     cleanup(() => window.clearTimeout(timer));
+  });
+
+  // 切到后台或关闭页面前尽力刷一次，减少丢改动
+  useVisibleTask$(({ cleanup }) => {
+    const onHide = () => { if (document.visibilityState === "hidden") void flushSave(); };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", onHide);
+    cleanup(() => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", onHide);
+    });
   });
 
   useVisibleTask$(({ cleanup }) => {
@@ -308,6 +382,21 @@ export default component$(() => {
         </div>
       )}
 
+      {storageStatus.value === "degraded" && (
+        <div class="alert alert-warning sticky top-16 z-30 rounded-none border-x-0 py-2">
+          <span class="text-lg">⚠</span>
+          <span><strong>本地存储已满</strong>：当前编辑仅保存在内存中，清理浏览器存储后请重试，避免改动丢失。</span>
+          <button class="btn btn-sm btn-outline" onClick$={retryStorage}>立即重试</button>
+        </div>
+      )}
+
+      {storageStatus.value === "reclaimed" && (
+        <div class="alert alert-info sticky top-16 z-30 rounded-none border-x-0 py-2">
+          <span class="text-lg">ℹ</span>
+          <span>存储空间不足，已回收最早的版本快照以保留当前编辑。</span>
+        </div>
+      )}
+
       <div class="grid min-h-[calc(100vh-64px)] grid-cols-[270px_minmax(560px,1fr)_430px] gap-px bg-slate-300">
         <aside class="overflow-y-auto bg-slate-50 p-3">
           <div class="mb-3 rounded-xl bg-white p-4 shadow-sm">
@@ -361,6 +450,49 @@ export default component$(() => {
           </div>
 
           <div class="space-y-5 p-6">
+            {activeConflicts().map((conflict) => (
+              <section key={conflict.id} class="card border-2 border-warning bg-amber-50 shadow-sm">
+                <div class="card-body gap-3 p-5">
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <div class="text-xs font-bold uppercase tracking-[0.16em] text-warning">并发修改待确认</div>
+                      <h2 class="font-bold">该标识在其他标签页也被修改</h2>
+                    </div>
+                    <span class="badge badge-warning">已留两份 · 待确认</span>
+                  </div>
+                  <p class="text-sm text-slate-600">
+                    两边都改动了{conflict.reasons.map((reason) => `「${reason}」`).join("、")}。已保留较新的远端版本，并把状态标记为待确认；本地版本副本如下，可选择采用或保留远端。
+                  </p>
+                  <div class="grid gap-3 md:grid-cols-2">
+                    <div class="rounded-lg border border-slate-200 bg-white p-3 text-sm">
+                      <div class="mb-1 text-xs font-bold text-slate-400">本地版本（本方编辑）</div>
+                      {conflict.local.targetText !== undefined && (
+                        <p class="whitespace-pre-line text-slate-700"><span class="text-slate-400">译文：</span>{conflict.local.targetText}</p>
+                      )}
+                      {conflict.local.status !== undefined && (
+                        <p class="text-slate-700"><span class="text-slate-400">审校状态：</span>{STATUS_LABELS[conflict.local.status]}</p>
+                      )}
+                      {conflict.local.termConfirmed && Object.keys(conflict.local.termConfirmed).length > 0 && (
+                        <p class="text-slate-700"><span class="text-slate-400">术语确认：</span>{Object.entries(conflict.local.termConfirmed).map(([id, confirmed]) => {
+                          const term = active().terms.find((item) => item.id === id);
+                          return term ? `${term.source}=${confirmed ? "已确认" : "未确认"}` : "";
+                        }).filter(Boolean).join("、")}</p>
+                      )}
+                    </div>
+                    <div class="rounded-lg border border-slate-200 bg-white p-3 text-sm">
+                      <div class="mb-1 text-xs font-bold text-slate-400">远端版本（已保留）</div>
+                      <p class="whitespace-pre-line text-slate-700"><span class="text-slate-400">译文：</span>{active().targetText}</p>
+                      <p class="text-slate-700"><span class="text-slate-400">审校状态：</span>{STATUS_LABELS[active().status]}</p>
+                    </div>
+                  </div>
+                  <div class="flex gap-2">
+                    <button class="btn btn-sm btn-primary" onClick$={() => resolveConflict(conflict.id, "local")}>采用本地版本</button>
+                    <button class="btn btn-sm btn-outline" onClick$={() => resolveConflict(conflict.id, "remote")}>保留远端版本</button>
+                  </div>
+                </div>
+              </section>
+            ))}
+
             <section class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body gap-4 p-5">
                 <div class="flex items-center justify-between">

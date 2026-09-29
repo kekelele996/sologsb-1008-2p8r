@@ -33,6 +33,7 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      conflicts: [],
       updatedAt: "2026-09-21T09:20:00.000Z",
     },
     {
@@ -48,6 +49,7 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      conflicts: [],
       updatedAt: "2026-09-18T06:10:00.000Z",
     },
     {
@@ -63,6 +65,7 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      conflicts: [],
       updatedAt: "2026-09-23T02:40:00.000Z",
     },
     {
@@ -78,6 +81,7 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      conflicts: [],
       updatedAt: "2026-09-24T04:15:00.000Z",
     },
   ];
